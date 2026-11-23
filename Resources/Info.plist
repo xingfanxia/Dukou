@@ -40,9 +40,9 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>本地文件中转工具，不解压也不上传分享内容。</string>
 	<key>SUEnableAutomaticChecks</key>
-	<true/>
+	<false/>
 	<key>SUFeedURL</key>
-	<string>https://qzz0518.github.io/Dukou/appcast.xml</string>
+	<string>https://xingfanxia.github.io/Dukou/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>ewhB3/oxtZ9y5jnrq3YiESbieGCF/XfRIMwOb94lYdE=</string>
 	<key>SURequireSignedFeed</key>
