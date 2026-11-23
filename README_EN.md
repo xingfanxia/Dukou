@@ -99,7 +99,7 @@ Download the latest `Dukou-*.dmg` from [Releases](https://github.com/qzz0518/Duk
 
 | Data | What Dukou does with it |
 |---|---|
-| The ZIP WeChat exports | Kept as is in Dukou's own container; only dates and counts are read, for naming |
+| The ZIP WeChat exports | Kept in Dukou's own container; only dates and counts are read, for naming. A quick WeChat forward changes one thing: a voice message already converted to text in the chat gets the text WeChat shows for it added to its 「[语音]」 line in the TXT. Everything else, attachments included, stays as it was, and the added text goes only into that export's ZIP |
 | The open chat's name | With Accessibility granted, read once from WeChat's window when a forward arrives, to name the file and remember a prompt per chat; stored on this Mac only |
 | Moments text and media | Read only when you start a Moments forward, packed into a ZIP under the same retention as chats |
 | Clipboard | Files, the attached prompt, or the paths a terminal asked for |

@@ -172,6 +172,11 @@ final class WeChatAccessibility {
     /// What asking the system what is under each click costs, for the report.
     private var hitTestSeconds = 0.0
     private var hitTests = 0
+    /// What each message of the batch being selected said, by ordinal, as the
+    /// walk passed over it in multi-select — text it reads anyway; see
+    /// `noteRow`. In memory only, and only until the batch is exported.
+    private var walkedRows: [Int: String] = [:]
+    private var walkedRowsDisagree = false
 
     init(chat: String, cancellation: WeChatCancellation, progress: @escaping (String) -> Void,
          makeRoom: @escaping (CGPoint) -> Bool = { _ in false }) throws {
@@ -1052,6 +1057,33 @@ final class WeChatAccessibility {
     private struct Selection {
         let count: Int
         let checkpoint: Checkpoint
+        /// What each selected row said, oldest first — the order WeChat writes
+        /// them to the TXT. Nil when one of them was never read, or was read
+        /// twice saying different things.
+        let rows: [String]?
+    }
+
+    /// Keeps what a selected message's row says. Every batch walks over all of
+    /// its rows before it selects them: the keyboard row steps through each
+    /// one in turn (`keyboardRange`), and the wheel fallback only advances by
+    /// views that overlap the last, which `WeChatViewport` would otherwise
+    /// refuse. So reading them here costs no gesture and no extra AX read.
+    private func noteRow(_ row: WCNode, ordinal: Int) {
+        guard row.id == "chat_bubble_item_view", row.role == "AXCheckBox" else { return }
+        let text = row.strings.first ?? ""
+        if let seen = walkedRows[ordinal] { walkedRowsDisagree = walkedRowsDisagree || seen != text }
+        else { walkedRows[ordinal] = text }
+    }
+
+    private func noteRows(_ page: Page, _ tracked: WeChatViewport, limit: Int) {
+        for (index, row) in page.rows.enumerated() where (0..<limit).contains(tracked.firstOrdinal - index) {
+            noteRow(row, ordinal: tracked.firstOrdinal - index)
+        }
+    }
+
+    private func selection(count: Int, checkpoint: Checkpoint) -> Selection {
+        let rows = (0..<count).reversed().compactMap { walkedRows[$0] }
+        return Selection(count: count, checkpoint: checkpoint, rows: rows.count == count && !walkedRowsDisagree ? rows : nil)
     }
     private struct Checkpoint {
         let viewport: WeChatViewport
@@ -1387,6 +1419,7 @@ final class WeChatAccessibility {
             if next.id == "chat_bubble_item_view" {
                 guard next.role == "AXCheckBox", !next.selected else { throw WeChatAutomationError.selection }
                 count += 1
+                noteRow(next, ordinal: count - 1)
             } else {
                 guard next.role == "AXStaticText" else { throw WeChatAutomationError.selection }
             }
@@ -1486,6 +1519,7 @@ final class WeChatAccessibility {
 
     private func selectBatch(limit: Int, start: SelectionStart, latestPage: Page? = nil) throws -> Selection {
         phase = "select-anchor"
+        walkedRows = [:]; walkedRowsDisagree = false
         let anchorIndex: Int, anchorPage: Page
         var resumedFromKeyboard = false
         switch start {
@@ -1573,7 +1607,8 @@ final class WeChatAccessibility {
         var page = selectedPage
         guard let index = page.rows.firstIndex(where: \.selected) else { throw WeChatAutomationError.selection }
         var tracked = WeChatViewport(rows: page.data, anchorIndex: index)
-        if limit == 1 { return Selection(count: 1, checkpoint: try checkpoint(tracked, page: page)) }
+        noteRow(page.rows[index], ordinal: 0)
+        if limit == 1 { return selection(count: 1, checkpoint: try checkpoint(tracked, page: page)) }
         var usedKeyboard = false
         if let (arrived, positioned) = try keyboardRange(from: page, limit: limit, endpointFocus: resumedFromKeyboard && !viaNeighbour) {
             page = arrived; tracked = positioned; usedKeyboard = true
@@ -1596,6 +1631,9 @@ final class WeChatAccessibility {
         }
         while true {
             try budget.observe(page)
+            // Every way back to here leaves `tracked` bound to `page`. The
+            // keyboard has already read each row on its way to the endpoint.
+            if !usedKeyboard { noteRows(page, tracked, limit: limit) }
             let tallest = page.rows.map(\.rect.height).max() ?? page.list.rect.height
             var delta = WeChatScrollStep.delta(
                 reach: WeChatScrollStep.reach(listHeight: page.list.rect.height, tallestRow: tallest,
@@ -1623,7 +1661,7 @@ final class WeChatAccessibility {
                     observe("after-shift-range", page)
                     do { try tracked.resume(page.data) } catch { throw WeChatAutomationError.selection }
                     guard page.rows.indices.filter({ page.rows[$0].selected }) == Array(target...newestIndex) else { throw WeChatAutomationError.selection }
-                    return Selection(count: limit, checkpoint: try checkpoint(tracked, page: page))
+                    return selection(count: limit, checkpoint: try checkpoint(tracked, page: page))
                 }
                 // Qt's range button excludes a row flush against its top
                 // edge. Native Up aligns exactly there; give it the same
@@ -1653,7 +1691,7 @@ final class WeChatAccessibility {
                             do { try tracked.resume(page.data) } catch { throw WeChatAutomationError.selection }
                         }
                         guard let endpoint = tracked.index(of: limit - 1), page.rows[endpoint].selected else { throw WeChatAutomationError.selection }
-                        return Selection(count: limit, checkpoint: try checkpoint(tracked, page: page, keyboardOrdinal: usedKeyboard ? limit - 1 : nil))
+                        return selection(count: limit, checkpoint: try checkpoint(tracked, page: page, keyboardOrdinal: usedKeyboard ? limit - 1 : nil))
                     }
                 }
                 let distance = page.list.rect.minY + 8 - row.rect.minY
@@ -1998,7 +2036,7 @@ final class WeChatAccessibility {
     }
 
     private func diagnostics(started: Double, outcome: String, count: Int) {
-        let report: [String: Any] = ["schemaVersion": 8, "strategy": "native-keyboard-range", "at": ISO8601DateFormatter().string(from: Date()),
+        let report: [String: Any] = ["schemaVersion": 9, "strategy": "native-keyboard-range", "at": ISO8601DateFormatter().string(from: Date()),
             "outcome": outcome, "phase": phase, "seconds": clock() - started, "messageCount": count,
             "navigationKeys": navigationKeys, "keyboardMessages": keyboardMessages, "scrolls": scrollCount, "scrollSeconds": scrollSeconds, "scanSeconds": scanSeconds, "scanCalls": scanCalls, "hitTestSeconds": hitTestSeconds, "hitTests": hitTests, "stableSeconds": stableSeconds, "exportSeconds": exportSeconds, "prefetchSeconds": prefetchSeconds, "prefetchRows": prefetchRows, "prefetchLoaded": prefetchLoaded, "scrollsByPhase": scrollsByPhase, "steps": steps, "clicks": clickCount, "rangeClicks": rangeClicks, "shiftRangeClicks": shiftRangeClicks, "exports": exportCount, "resumedBatches": resumedBatches, "keyboardPins": keyboardPins,
             "snapshots": snapshots, "unsettled": unsettled ?? [:], "receiptReadRetries": receiptReadRetries,
@@ -2060,6 +2098,10 @@ final class WeChatAccessibility {
             let directory = try nativeExport(ready: ready, shelfExtension: shelfExtension)
             start = .resume(selected.checkpoint, ordinal: selected.count)
             phase = "archive"
+            // Before anything reads the receipt, so every delivery — and a run
+            // carried on from here later — has the transcripts.
+            steps.append(try WeChatArchive.mergeVoiceTranscripts(rows: selected.rows, directory: directory, cancellation: cancellation))
+            walkedRows = [:]
             let exportedCount = try WeChatArchive.messageCount(directory: directory, cancellation: cancellation)
             steps.append(["kind": "archive", "selected": selected.count,
                           "messages": exportedCount ?? selected.count, "estimated": exportedCount == nil])

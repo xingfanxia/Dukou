@@ -115,6 +115,134 @@ public enum WeChatNativeArchive {
         return count
     }
 
+    /// The one ZIP in a quick forward's receipt — `Ready/<batch>/` as the
+    /// 暂存到渡口 entry committed it — and the manifest that describes it.
+    public struct Receipt: Sendable {
+        public let manifest: BatchManifest
+        public let item: ManifestItem
+        public let file: URL
+        public let data: Data
+    }
+
+    /// Fails closed on anything but exactly one ZIP, inside the batch
+    /// directory, of the size its manifest records.
+    public static func receipt(at directory: URL) throws -> Receipt {
+        let manifest = try BatchManifest.decoder().decode(BatchManifest.self, from: Data(contentsOf: directory.appendingPathComponent(BatchStaging.manifestFileName)))
+        guard manifest.schemaVersion == BatchManifest.currentSchemaVersion, manifest.action == .shelf,
+              manifest.batchID.uuidString == directory.lastPathComponent, manifest.items.count == 1,
+              let item = manifest.items.first else { throw WeChatReadError.invalidTranscript }
+        let file = directory.appendingPathComponent(item.relativePath).resolvingSymlinksInPath()
+        guard file.path.hasPrefix(directory.resolvingSymlinksInPath().path + "/"), file.pathExtension.lowercased() == "zip" else { throw WeChatReadError.invalidTranscript }
+        let data = try Data(contentsOf: file, options: .mappedIfSafe)
+        guard Int64(data.count) == item.byteCount else { throw WeChatReadError.invalidTranscript }
+        return Receipt(manifest: manifest, item: item, file: file, data: data)
+    }
+
+    /// One entry's bytes as WeChat wrote them, CRC checked — not decoded, so
+    /// a byte order mark or a CR survives.
+    static func contents(of path: String, in data: Data, checkCancellation: () throws -> Void = {}) throws -> Data {
+        guard let entry = try directory(data).first(where: { $0.name == path }) else { throw WeChatReadError.invalidTranscript }
+        return try read(entry, from: data, collect: true, checkCancellation: checkCancellation)
+    }
+
+    /// `data` with the entry at `path` holding `contents` instead, handed to
+    /// `output` a piece at a time so a ZIP full of video is never held twice.
+    ///
+    /// Only for the voice transcripts `WeChatVoiceTranscripts` adds to the
+    /// native TXT. Every other entry keeps the compressed bytes, CRC, sizes,
+    /// times and attributes WeChat gave it; only its headers are written
+    /// afresh. The replacement is stored, which `read` takes as readily as
+    /// deflate. What comes out is the one shape `directory` accepts — no data
+    /// descriptor, ZIP64, extra field or comment, the central directory right
+    /// after the last entry — whatever the source carried of those.
+    static func replacing(_ path: String, with contents: Data, in data: Data,
+                          to output: (Data) throws -> Void, checkCancellation: () throws -> Void = {}) throws {
+        let entries = try directory(data)
+        guard entries.filter({ $0.name == path }).count == 1 else { throw WeChatReadError.invalidTranscript }
+        func put(_ value: Int, _ bytes: Int, into data: inout Data) {
+            for index in 0..<bytes { data.append(UInt8(truncatingIfNeeded: value >> (index * 8))) }
+        }
+        var central = Data(), written = 0
+        func emit(_ chunk: Data) throws {
+            try output(chunk)
+            written += chunk.count
+        }
+        for entry in entries {
+            try checkCancellation()
+            let replaced = entry.name == path
+            let start = try payload(of: entry, in: data)
+            let nameLength = try number(data, entry.header + 28, 2)
+            let name = data.subdata(in: entry.header + 46..<entry.header + 46 + nameLength)
+            // The data descriptor goes: these headers carry the sizes. A stored
+            // replacement keeps only the UTF-8 name flag.
+            let original = try number(data, entry.header + 8, 2)
+            let flags = replaced ? original & 0x0800 : original & ~0x0008
+            let method = replaced ? 0 : entry.method
+            let crc = replaced ? Int(contents.withUnsafeBytes { crc32(0, $0.bindMemory(to: Bytef.self).baseAddress, uInt($0.count)) }) : Int(entry.crc)
+            let size = replaced ? contents.count : entry.compressed
+            let expanded = replaced ? contents.count : entry.expanded
+            // 0xFFFFFFFF would announce ZIP64, which `directory` refuses.
+            guard written < 0xFFFF_FFFF, size < 0xFFFF_FFFF, expanded < 0xFFFF_FFFF,
+                  written + 30 + nameLength + size < 0xFFFF_FFFF else { throw WeChatReadError.invalidTranscript }
+            let needed = try number(data, entry.header + 6, 2)
+            let time = try number(data, entry.header + 12, 2), date = try number(data, entry.header + 14, 2)
+            let offset = written
+            var local = Data()
+            put(0x04034b50, 4, into: &local)
+            for value in [needed, flags, method, time, date] { put(value, 2, into: &local) }
+            for value in [crc, size, expanded] { put(value, 4, into: &local) }
+            put(nameLength, 2, into: &local); put(0, 2, into: &local)
+            local.append(name)
+            try emit(local)
+            if replaced {
+                try emit(contents)
+            } else {
+                for chunk in stride(from: 0, to: size, by: 1_048_576) {
+                    try checkCancellation()
+                    try emit(data.subdata(in: start + chunk..<start + min(size, chunk + 1_048_576)))
+                }
+            }
+            put(0x02014b50, 4, into: &central)
+            for value in [try number(data, entry.header + 4, 2), needed, flags, method, time, date] { put(value, 2, into: &central) }
+            for value in [crc, size, expanded] { put(value, 4, into: &central) }
+            // No extra field, no comment, disk 0; attributes as they were.
+            for value in [nameLength, 0, 0, 0, try number(data, entry.header + 36, 2)] { put(value, 2, into: &central) }
+            put(try number(data, entry.header + 38, 4), 4, into: &central)
+            put(offset, 4, into: &central)
+            central.append(name)
+        }
+        let directoryStart = written
+        guard directoryStart + central.count < 0xFFFF_FFFF else { throw WeChatReadError.invalidTranscript }
+        var end = Data()
+        put(0x06054b50, 4, into: &end)
+        for value in [0, 0, entries.count, entries.count] { put(value, 2, into: &end) }
+        put(central.count, 4, into: &end); put(directoryStart, 4, into: &end); put(0, 2, into: &end)
+        try checkCancellation()
+        try emit(central)
+        try emit(end)
+    }
+
+    /// Whether `written` is `original` with only `path` changed, to
+    /// `contents`: the same entries in the same order, every other one with
+    /// the same method, CRC, sizes, type and compressed bytes, and `path`
+    /// reading back, CRC and all, as `contents`. Checked before a rewritten
+    /// archive replaces WeChat's, which is not kept.
+    static func isReplacement(_ written: Data, of original: Data, at path: String, holding contents: Data) -> Bool {
+        guard let before = try? directory(original), let after = try? directory(written), before.count == after.count else { return false }
+        for (old, new) in zip(before, after) {
+            guard old.name == new.name, old.fileType == new.fileType else { return false }
+            if new.name == path {
+                guard (try? read(new, from: written, collect: true, checkCancellation: {})) == contents else { return false }
+                continue
+            }
+            guard old.method == new.method, old.crc == new.crc, old.compressed == new.compressed, old.expanded == new.expanded,
+                  let from = try? payload(of: old, in: original), let to = try? payload(of: new, in: written),
+                  // Slices share the mapped bytes; `==` compares them without a copy.
+                  original[from..<from + old.compressed] == written[to..<to + new.compressed] else { return false }
+        }
+        return true
+    }
+
     private struct Entry {
         let name: String
         let method: Int
@@ -123,6 +251,8 @@ public enum WeChatNativeArchive {
         let expanded: Int
         let offset: Int
         let fileType: Int
+        /// Where its central directory record starts.
+        let header: Int
     }
     private static func number(_ data: Data, _ offset: Int, _ bytes: Int) throws -> Int {
         guard offset >= 0, offset <= data.count - bytes else { throw WeChatReadError.invalidTranscript }
@@ -150,7 +280,7 @@ public enum WeChatNativeArchive {
             guard let name = String(data: rawName, encoding: .utf8), !name.isEmpty, seen.insert(name).inserted else { throw WeChatReadError.invalidTranscript }
             let entry = Entry(name: name, method: method, crc: UInt32(try number(data, cursor + 16, 4)),
                               compressed: try number(data, cursor + 20, 4), expanded: try number(data, cursor + 24, 4), offset: try number(data, cursor + 42, 4),
-                              fileType: try (number(data, cursor + 38, 4) >> 16) & 0o170000)
+                              fileType: try (number(data, cursor + 38, 4) >> 16) & 0o170000, header: cursor)
             total += entry.expanded
             guard total <= 1_073_741_824, entry.offset < start else { throw WeChatReadError.invalidTranscript }
             entries.append(entry)
@@ -159,12 +289,17 @@ public enum WeChatNativeArchive {
         guard cursor == end else { throw WeChatReadError.invalidTranscript }
         return entries
     }
-    private static func read(_ entry: Entry, from data: Data, collect: Bool, checkCancellation: () throws -> Void, write: ((Data) throws -> Void)? = nil) throws -> Data {
-        guard !collect || entry.expanded <= 16_777_216,
-              try number(data, entry.offset, 4) == 0x04034b50,
+    /// Where an entry's compressed bytes start, past its local header.
+    private static func payload(of entry: Entry, in data: Data) throws -> Int {
+        guard try number(data, entry.offset, 4) == 0x04034b50,
               try number(data, entry.offset + 8, 2) == entry.method else { throw WeChatReadError.invalidTranscript }
         let start = try entry.offset + 30 + number(data, entry.offset + 26, 2) + number(data, entry.offset + 28, 2)
         guard start <= data.count, entry.compressed <= data.count - start else { throw WeChatReadError.invalidTranscript }
+        return start
+    }
+    private static func read(_ entry: Entry, from data: Data, collect: Bool, checkCancellation: () throws -> Void, write: ((Data) throws -> Void)? = nil) throws -> Data {
+        guard !collect || entry.expanded <= 16_777_216 else { throw WeChatReadError.invalidTranscript }
+        let start = try payload(of: entry, in: data)
         var result = Data(), crc = crc32(0, nil, 0), expanded = 0
         if collect { result.reserveCapacity(entry.expanded) }
         try data.withUnsafeBytes { (input: UnsafeRawBufferPointer) in
