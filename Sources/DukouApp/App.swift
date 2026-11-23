@@ -46,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var actionRunner: ActionRunner?
     private var wechat: WeChatQuickForward?
     private var moments: MomentsQuickForward?
+    private var listWatch: WeChatListWatch?
     private var statusItem: StatusItemController?
     private var cancellables = Set<AnyCancellable>()
     private var settingsWindow: SettingsWindowController?
@@ -135,6 +136,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wechat.otherAutomationIsBusy = { [weak moments] in moments?.isBusy ?? false }
         moments.otherAutomationIsBusy = { [weak wechat] in (wechat?.isBusy ?? false) || (wechat?.isReadingChat ?? false) }
         runner.reservedFrame = { [weak wechat, weak moments] in moments?.hudFrame ?? wechat?.hudFrame }
+        // Forwards made by hand: see `WeChatListObserver`. It stands aside
+        // while a quick forward drives WeChat.
+        let listObserver = WeChatListObserver()
+        model.listObserver = listObserver
+        listWatch = WeChatListWatch(
+            observer: listObserver, authorization: authorization,
+            automationBusy: wechat.$isBusy.combineLatest(moments.$isBusy).map { $0 || $1 }.eraseToAnyPublisher()
+        )
 
         // One place decides what an arriving batch means; the shelf and the
         // forwards are both just outcomes of it.

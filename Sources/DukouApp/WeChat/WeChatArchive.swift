@@ -46,4 +46,42 @@ enum WeChatArchive {
         }
         return report
     }
+
+    /// The same for a forward made by hand, from what `WeChatListObserver`
+    /// saw of the conversation; see `WeChatVoiceMatch`. Counts only.
+    static func mergeObservedVoiceTranscripts(_ evidence: WeChatListEvidence, directory: URL) -> [String: Any] {
+        var report: [String: Any] = ["kind": "voice-transcripts", "source": "observed-list",
+                                     "stretches": evidence.stretches.count, "rows": evidence.rowCount]
+        do {
+            switch try WeChatVoiceMatch.merge(evidence, intoReceiptAt: directory) {
+            case .noVoiceLines: report["outcome"] = "no-voice"
+            case .alreadyMerged: report["outcome"] = "already-merged"
+            case .unreadable: report["outcome"] = "unreadable"
+            case .notObserved(let voiceLines): report["outcome"] = "not-observed"; report["inExport"] = voiceLines
+            case .inconsistent(let voiceLines): report["outcome"] = "inconsistent"; report["inExport"] = voiceLines
+            case .matched(let summary):
+                report["outcome"] = summary.attached > 0 ? "merged" : "unmatched"
+                report["inExport"] = summary.voiceLines
+                report["merged"] = summary.attached
+                report["notConverted"] = summary.notConverted
+                report["ambiguous"] = summary.ambiguous
+                report["unseen"] = summary.unseen
+            }
+        } catch {
+            report["outcome"] = "failed"
+        }
+        return report
+    }
+
+    /// Beside latest.json, which belongs to quick forward: the last forward
+    /// made by hand that Dukou looked at. Same privacy — counts, never text.
+    static func recordManualForward(_ steps: [[String: Any]], observer: [String: Any]) {
+        let report: [String: Any] = ["schemaVersion": 1, "at": ISO8601DateFormatter().string(from: Date()),
+                                     "steps": steps, "observer": observer]
+        let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Dukou/WeChat")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: folder.appendingPathComponent("manual-forward.json"), options: .atomic)
+        }
+    }
 }

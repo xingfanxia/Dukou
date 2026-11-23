@@ -73,20 +73,7 @@ public enum WeChatVoiceTranscripts {
     /// is copied through, a byte order mark and CRs included. Decoding it to
     /// a `String` would drop the first and fold CRLF into one character.
     public static func merge(_ voices: [WeChatVoiceMessage], into text: Data) -> (text: Data, outcome: Outcome) {
-        let bytes = [UInt8](text)
-        // Where each voice line's own text ends, before any CR, and its duration.
-        var lines: [(end: Int, seconds: Int)] = []
-        var start = 0
-        while start <= bytes.count {
-            let next = bytes[start...].firstIndex(of: 0x0A) ?? bytes.count
-            var from = start, end = next
-            if start == 0, bytes.starts(with: [0xEF, 0xBB, 0xBF]) { from = 3 }
-            if end > from, bytes[end - 1] == 0x0D { end -= 1 }
-            if end >= from, let seconds = seconds(inVoiceLine: String(decoding: bytes[from..<end], as: UTF8.self)) {
-                lines.append((end, seconds))
-            }
-            start = next + 1
-        }
+        let lines = voiceLines(in: text)
         if lines.isEmpty && voices.isEmpty { return (text, .noVoiceMessages) }
         guard lines.map(\.seconds) == voices.map(\.seconds) else {
             let differ = zip(lines, voices).enumerated().first { $0.element.0.seconds != $0.element.1.seconds }?.offset
@@ -94,16 +81,52 @@ public enum WeChatVoiceTranscripts {
         }
         let transcripts = voices.filter { !$0.transcript.isEmpty }.count
         guard transcripts > 0 else { return (text, .noTranscripts(voiceMessages: voices.count)) }
+        var added: [Int: String] = [:]
+        for (ordinal, voice) in voices.enumerated() where !voice.transcript.isEmpty { added[ordinal] = voice.transcript }
+        return (insert(added, into: text, at: lines), .merged(voiceMessages: voices.count, transcripts: transcripts))
+    }
+
+    /// One of the export's voice lines: where its own text ends, before any
+    /// CR, and its duration.
+    struct VoiceLine: Equatable {
+        let end: Int
+        let seconds: Int
+    }
+
+    /// The export's voice lines, oldest first. The text is split on LF alone
+    /// and read as bytes, so the offsets are the file's own.
+    static func voiceLines(in text: Data) -> [VoiceLine] {
+        let bytes = [UInt8](text)
+        var lines: [VoiceLine] = []
+        var start = 0
+        while start <= bytes.count {
+            let next = bytes[start...].firstIndex(of: 0x0A) ?? bytes.count
+            var from = start, end = next
+            if start == 0, bytes.starts(with: [0xEF, 0xBB, 0xBF]) { from = 3 }
+            if end > from, bytes[end - 1] == 0x0D { end -= 1 }
+            if end >= from, let seconds = seconds(inVoiceLine: String(decoding: bytes[from..<end], as: UTF8.self)) {
+                lines.append(VoiceLine(end: end, seconds: seconds))
+            }
+            start = next + 1
+        }
+        return lines
+    }
+
+    /// `text` with each transcript on the end of the voice line of its
+    /// ordinal in `lines`, and every other byte copied through.
+    static func insert(_ transcripts: [Int: String], into text: Data, at lines: [VoiceLine]) -> Data {
+        let bytes = [UInt8](text)
         var output = Data()
-        output.reserveCapacity(bytes.count + voices.reduce(0) { $0 + $1.transcript.utf8.count + 16 })
+        output.reserveCapacity(bytes.count + transcripts.values.reduce(0) { $0 + $1.utf8.count + 16 })
         var copied = 0
-        for (line, voice) in zip(lines, voices) where !voice.transcript.isEmpty {
+        for (ordinal, line) in lines.enumerated() {
+            guard let transcript = transcripts[ordinal], !transcript.isEmpty else { continue }
             output.append(contentsOf: bytes[copied..<line.end])
-            output.append(contentsOf: Array((label + voice.transcript).utf8))
+            output.append(contentsOf: Array((label + transcript).utf8))
             copied = line.end
         }
         output.append(contentsOf: bytes[copied...])
-        return (output, .merged(voiceMessages: voices.count, transcripts: transcripts))
+        return output
     }
 
     /// A line that is a voice message and nothing else: `[语音] 18"`, or
@@ -121,6 +144,15 @@ public enum WeChatVoiceTranscripts {
         return Int(digits)
     }
 
+    /// A voice line a merge has already been at: `[语音] 18" 转文字：…`.
+    static func isMergedVoiceLine(_ line: Substring) -> Bool {
+        var rest = line
+        if rest.first == "·" { rest = rest.dropFirst() }
+        guard let close = rest.firstIndex(of: "\""),
+              seconds(inVoiceLine: String(rest[...close])) != nil else { return false }
+        return rest[rest.index(after: close)...].hasPrefix(label)
+    }
+
     /// The receipt at `directory`, its TXT rewritten in place when `merge`
     /// has something to add; untouched in every other outcome and whenever
     /// this throws.
@@ -134,16 +166,32 @@ public enum WeChatVoiceTranscripts {
     /// confirms before the new file takes the old one's place.
     public static func merge(_ voices: [WeChatVoiceMessage], intoReceiptAt directory: URL,
                              checkCancellation: () throws -> Void = {}) throws -> Outcome {
+        try rewriteTranscript(
+            ofReceiptAt: directory, accepting: [.shelf], checkCancellation: checkCancellation,
+            withoutTranscript: voices.isEmpty ? .noVoiceMessages : .mismatch(inExport: 0, onScreen: voices.count, firstDifference: nil)
+        ) { original in
+            let (text, outcome) = merge(voices, into: original)
+            guard case .merged = outcome else { return (nil, outcome) }
+            return (text, outcome)
+        }
+    }
+
+    /// The receipt's TXT handed to `change`, and written back in place when
+    /// `change` returns new text — see `merge(_:intoReceiptAt:)`. A receipt
+    /// whose ZIP has no TXT says `withoutTranscript`.
+    static func rewriteTranscript<Result>(ofReceiptAt directory: URL, accepting actions: Set<ShareAction>,
+                                          checkCancellation: () throws -> Void, withoutTranscript: Result,
+                                          _ change: (Data) -> (text: Data?, result: Result)) throws -> Result {
         try checkCancellation()
-        let receipt = try WeChatNativeArchive.receipt(at: directory)
+        let receipt = try WeChatNativeArchive.receipt(at: directory, accepting: actions)
         guard let transcript = try WeChatNativeArchive.transcript(receipt.data, checkCancellation: checkCancellation) else {
-            return voices.isEmpty ? .noVoiceMessages : .mismatch(inExport: 0, onScreen: voices.count, firstDifference: nil)
+            return withoutTranscript
         }
         let original = try WeChatNativeArchive.contents(of: transcript.path, in: receipt.data, checkCancellation: checkCancellation)
-        let (text, outcome) = merge(voices, into: original)
-        guard case .merged = outcome else { return outcome }
+        let (text, result) = change(original)
+        guard let text, text != original else { return result }
         try rewrite(receipt, at: directory, replacing: transcript.path, with: text, checkCancellation: checkCancellation)
-        return outcome
+        return result
     }
 
     /// The new ZIP is written beside the old one and checked; then it takes

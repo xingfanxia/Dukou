@@ -115,8 +115,8 @@ public enum WeChatNativeArchive {
         return count
     }
 
-    /// The one ZIP in a quick forward's receipt — `Ready/<batch>/` as the
-    /// 暂存到渡口 entry committed it — and the manifest that describes it.
+    /// The one ZIP in a receipt — `Ready/<batch>/` as a share entry committed
+    /// it — and the manifest that describes it.
     public struct Receipt: Sendable {
         public let manifest: BatchManifest
         public let item: ManifestItem
@@ -125,10 +125,12 @@ public enum WeChatNativeArchive {
     }
 
     /// Fails closed on anything but exactly one ZIP, inside the batch
-    /// directory, of the size its manifest records.
-    public static func receipt(at directory: URL) throws -> Receipt {
+    /// directory, of the size its manifest records, from one of `actions`'
+    /// entries. A quick forward's receipts come from 暂存到渡口 alone; a
+    /// forward made by hand can come from any entry.
+    public static func receipt(at directory: URL, accepting actions: Set<ShareAction> = [.shelf]) throws -> Receipt {
         let manifest = try BatchManifest.decoder().decode(BatchManifest.self, from: Data(contentsOf: directory.appendingPathComponent(BatchStaging.manifestFileName)))
-        guard manifest.schemaVersion == BatchManifest.currentSchemaVersion, manifest.action == .shelf,
+        guard manifest.schemaVersion == BatchManifest.currentSchemaVersion, actions.contains(manifest.action),
               manifest.batchID.uuidString == directory.lastPathComponent, manifest.items.count == 1,
               let item = manifest.items.first else { throw WeChatReadError.invalidTranscript }
         let file = directory.appendingPathComponent(item.relativePath).resolvingSymlinksInPath()
@@ -148,13 +150,14 @@ public enum WeChatNativeArchive {
     /// `data` with the entry at `path` holding `contents` instead, handed to
     /// `output` a piece at a time so a ZIP full of video is never held twice.
     ///
-    /// Only for the voice transcripts `WeChatVoiceTranscripts` adds to the
-    /// native TXT. Every other entry keeps the compressed bytes, CRC, sizes,
-    /// times and attributes WeChat gave it; only its headers are written
-    /// afresh. The replacement is stored, which `read` takes as readily as
-    /// deflate. What comes out is the one shape `directory` accepts — no data
-    /// descriptor, ZIP64, extra field or comment, the central directory right
-    /// after the last entry — whatever the source carried of those.
+    /// Only for the voice transcripts `WeChatVoiceTranscripts` and
+    /// `WeChatVoiceMatch` add to the native TXT. Every other entry keeps the
+    /// compressed bytes, CRC, sizes, times and attributes WeChat gave it; only
+    /// its headers are written afresh. The replacement is stored, which `read`
+    /// takes as readily as deflate. What comes out is the one shape
+    /// `directory` accepts — no data descriptor, ZIP64, extra field or
+    /// comment, the central directory right after the last entry — whatever
+    /// the source carried of those.
     static func replacing(_ path: String, with contents: Data, in data: Data,
                           to output: (Data) throws -> Void, checkCancellation: () throws -> Void = {}) throws {
         let entries = try directory(data)

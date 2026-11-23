@@ -58,7 +58,7 @@ One step further, Quick WeChat forward and Quick Moments forward (experimental) 
 
 ## What it does not do
 
-- No database reads, no decryption, no injection, no changes to WeChat. Chat content comes only from the ZIP WeChat itself exports.
+- No database reads, no decryption, no injection, no changes to WeChat. Chat content comes only from the ZIP WeChat itself exports, and from the messages WeChat is showing while it is in front (used only to add the text of converted voice messages, and kept in memory only).
 - No network, except checking for updates. Every entry is a sandboxed extension without network permission.
 - No private APIs. Switching apps and pressing ⌘V for you go through public system interfaces, behind a permission you grant.
 
@@ -99,7 +99,8 @@ Download the latest `Dukou-*.dmg` from [Releases](https://github.com/qzz0518/Duk
 
 | Data | What Dukou does with it |
 |---|---|
-| The ZIP WeChat exports | Kept in Dukou's own container; only dates and counts are read, for naming. A quick WeChat forward changes one thing: a voice message already converted to text in the chat gets the text WeChat shows for it added to its 「[语音]」 line in the TXT. Everything else, attachments included, stays as it was, and the added text goes only into that export's ZIP |
+| The ZIP WeChat exports | Kept in Dukou's own container; only dates and counts are read, for naming. One thing is changed: a voice message already converted to text in the chat gets the text WeChat shows for it added to its 「[语音]」 line in the TXT. For a forward you multi-selected by hand, only a voice message Dukou can tell apart for certain gets it; a line it cannot be sure of stays as it was. Everything else, attachments included, stays as it was, and the added text goes only into that export's ZIP |
+| WeChat's message list | With Accessibility granted and WeChat in front, Dukou reads the few messages the list is showing (their text, the text of converted voice messages, whether they are ticked in multi-select) and the chat's name every fraction of a second, to add voice text to forwards made by hand. Read only: no clicks, no keystrokes. Kept in memory only, never written to disk or sent anywhere, and dropped ten minutes after it was last seen or when WeChat quits; not read while a quick forward runs |
 | The open chat's name | With Accessibility granted, read once from WeChat's window when a forward arrives, to name the file and remember a prompt per chat; stored on this Mac only |
 | Moments text and media | Read only when you start a Moments forward, packed into a ZIP under the same retention as chats |
 | Clipboard | Files, the attached prompt, or the paths a terminal asked for |

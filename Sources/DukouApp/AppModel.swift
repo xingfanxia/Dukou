@@ -116,6 +116,9 @@ final class AppModel: ObservableObject {
     /// `DirectShareEntries.relayInbox`.
     private var relayWatcher: InboxWatcher?
     private var intakeDeferralCount = 0
+    /// What WeChat's message list showed while the user selected by hand;
+    /// see `nameThenAnnounce`. Set by the app delegate.
+    var listObserver: WeChatListObserver?
 
     func deferIntake() { intakeDeferralCount += 1 }
     func resumeIntake() {
@@ -221,17 +224,30 @@ final class AppModel: ObservableObject {
     /// Names the export after its chat the way a quick forward does, then lets
     /// the batch arrive. The name comes first because a forward pastes the
     /// file's URL: renaming after the paste would hand the target a dead path.
+    ///
+    /// Before the name, the TXT gets the transcripts of its converted voice
+    /// messages, from what the list showed while the user selected them —
+    /// rewritten in place, before any delivery reads the ZIP. A quick
+    /// forward's receipts never come through here: intake is held while it
+    /// runs and its batches are already initialised when it resumes. The
+    /// clipboard entry is the exception to "before any delivery": the
+    /// extension has already put the file's URL on the pasteboard, so a paste
+    /// made in the moment this takes reads WeChat's original — whole either
+    /// way, since the new file replaces it in one rename.
     private func nameThenAnnounce(_ batch: ReadyBatch, reader: InboxReader) {
         let original = batch.items[0].url
         let nameTemplate = preferences.archiveNameTemplate
+        let observer = listObserver, inbox = reader.inbox
         Task { [weak self] in
             let chat: String? = await withCheckedContinuation { continuation in
                 Self.chatNameWorker.async {
                     let chat = try? WeChatAccessibility.currentChat()
                     if let chat, !chat.isEmpty {
+                        observer?.mergeTranscripts(intoBatchAt: batch.directory, chat: chat, exportedAt: batch.createdAt)
+                        // Read again: a merge leaves the ZIP a different size.
                         try? WeChatExportArchive.rename(
-                            batch, chat: chat, fallbackCount: nil, exportedAt: batch.createdAt, nameTemplate: nameTemplate,
-                            requiringRecords: true
+                            InboxReader(inbox: inbox).batch(at: batch.directory) ?? batch, chat: chat, fallbackCount: nil,
+                            exportedAt: batch.createdAt, nameTemplate: nameTemplate, requiringRecords: true
                         )
                     }
                     continuation.resume(returning: chat)
