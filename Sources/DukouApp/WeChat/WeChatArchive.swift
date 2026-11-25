@@ -1,4 +1,5 @@
 import DukouCore
+import DukouWeChatDatabase
 import Foundation
 
 enum WeChatArchive {
@@ -53,7 +54,12 @@ enum WeChatArchive {
         var report: [String: Any] = ["kind": "voice-transcripts", "source": "observed-list",
                                      "stretches": evidence.stretches.count, "rows": evidence.rowCount]
         do {
-            switch try WeChatVoiceMatch.merge(evidence, intoReceiptAt: directory) {
+            // TEMPORARY: the explanation is of WeChat's own TXT; once
+            // rewritten, the TXT reads as already merged.
+            let outcome = try WeChatVoiceMatch.merge(evidence, intoReceiptAt: directory, original: {
+                recordManualForwardEvidence(WeChatVoiceMatch.explain(evidence, text: $0))
+            })
+            switch outcome {
             case .noVoiceLines: report["outcome"] = "no-voice"
             case .alreadyMerged: report["outcome"] = "already-merged"
             case .unreadable: report["outcome"] = "unreadable"
@@ -66,11 +72,49 @@ enum WeChatArchive {
                 report["notConverted"] = summary.notConverted
                 report["ambiguous"] = summary.ambiguous
                 report["unseen"] = summary.unseen
+                report["ticksIgnored"] = summary.ticksIgnored
+                report["contradicting"] = summary.contradicting
             }
         } catch {
             report["outcome"] = "failed"
         }
         return report
+    }
+
+    /// The same from WeChat's own database, when the user turned that on;
+    /// see `WeChatDatabase`. Bounded by `WeChatDatabase.searchSeconds`, since
+    /// the forward waits for it. Counts only — no text, name, username, table
+    /// or key.
+    static func mergeDatabaseVoiceTranscripts(directory: URL) -> [String: Any] {
+        let report = WeChatDatabase.merge(intoReceiptAt: directory, deadline: Date().addingTimeInterval(WeChatDatabase.searchSeconds))
+        var step: [String: Any] = ["kind": "voice-transcripts", "source": "database", "outcome": report.outcome.rawValue,
+                                   "milliseconds": report.milliseconds]
+        if let unreadable = report.unreadable { step["unreadable"] = unreadable }
+        if report.timedOut { step["timedOut"] = true }
+        if report.summary.voiceLines > 0 {
+            step["inExport"] = report.summary.voiceLines
+            step["merged"] = report.summary.attached
+            step["notConverted"] = report.summary.notConverted
+            step["ambiguous"] = report.summary.ambiguous
+            step["filesSearched"] = report.files
+            step["tablesSearched"] = report.tables
+        }
+        return step
+    }
+
+    /// TEMPORARY, diagnostics for this fork while matching is being tuned:
+    /// `WeChatVoiceMatch.explain` of the last forward made by hand, beside
+    /// manual-forward.json and replaced by every one. No text, as there.
+    static func recordManualForwardEvidence(_ explanation: [String: Any]) {
+        var report = explanation
+        report["schemaVersion"] = 1
+        report["at"] = ISO8601DateFormatter().string(from: Date())
+        let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Dukou/WeChat")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let file = folder.appendingPathComponent("manual-forward-evidence.json")
+        guard let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]),
+              (try? data.write(to: file, options: .atomic)) != nil else { return }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
 
     /// Beside latest.json, which belongs to quick forward: the last forward

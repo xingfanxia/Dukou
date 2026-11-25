@@ -47,6 +47,7 @@ final class Preferences: ObservableObject {
         static let chatMemory = "dev.dukou.chatMemory"
         static let showDockIcon = "dev.dukou.showDockIcon"
         static let archiveNameTemplate = "dev.dukou.archiveNameTemplate"
+        static let readsVoiceTranscriptsFromDatabase = "dev.dukou.voiceTranscriptsFromDatabase"
     }
 
     /// A week: long enough that last Friday's chat export is still there on
@@ -84,6 +85,7 @@ final class Preferences: ObservableObject {
             )
         chatMemory = defaults.data(forKey: Key.chatMemory)
             .flatMap { try? JSONDecoder().decode(ChatMemories.self, from: $0) } ?? ChatMemories()
+        readsVoiceTranscriptsFromDatabase = defaults.bool(forKey: Key.readsVoiceTranscriptsFromDatabase)
     }
 
     /// Set only by finishing the guide. Closing its window half way through is
@@ -151,6 +153,12 @@ final class Preferences: ObservableObject {
             guard let data = try? JSONEncoder().encode(prompt) else { return }
             defaults.set(data, forKey: Key.prompt)
         }
+    }
+
+    /// Off unless the user turns it on: a forward made by hand gets its voice
+    /// transcripts from WeChat's own database; see `WeChatDatabase`.
+    @Published var readsVoiceTranscriptsFromDatabase: Bool {
+        didSet { defaults.set(readsVoiceTranscriptsFromDatabase, forKey: Key.readsVoiceTranscriptsFromDatabase) }
     }
 
     /// Which prompt each chat uses, and how far each prompt has got with it.

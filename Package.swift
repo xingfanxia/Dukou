@@ -30,10 +30,28 @@ let package = Package(
                 .unsafeFlags(["-application-extension"]),
             ]
         ),
+        // Reading voice transcripts out of WeChat's own message database, an
+        // opt-in of the app's (`WeChatDatabase`). Apart from DukouCore so the
+        // share extensions link neither SQLite nor the zstd decoder.
+        .target(
+            name: "DukouWeChatDatabase",
+            dependencies: ["DukouCore", "CZstd"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // zstd's own single-file decoder, generated from facebook/zstd v1.5.7
+        // with its build/single_file_libs/combine.sh (THIRD-PARTY-NOTICES.md).
+        // WeChat compresses long texts and every XML payload in its message
+        // database with zstd, and the shipped app must not lean on a library
+        // installed beside it.
+        .target(
+            name: "CZstd",
+            exclude: ["LICENSE"]
+        ),
         .executableTarget(
             name: "DukouApp",
             dependencies: [
                 "DukouCore",
+                "DukouWeChatDatabase",
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
@@ -67,7 +85,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DukouCoreTests",
-            dependencies: ["DukouCore"],
+            dependencies: ["DukouCore", "DukouWeChatDatabase"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

@@ -18,8 +18,8 @@ import Foundation
 /// and frame) and one per laid-out child at the bottom of it — typically a
 /// dozen or two cross-process calls. Looks come every 0.12 s while the list
 /// is changing and every 0.4 s once it has been still for 3 s. Finding the
-/// list in the first place walks WeChat's window, and happens only when the
-/// list or the conversation changes.
+/// list and the chat's name walks WeChat's window — under a hundred reads
+/// with a conversation open — and is done again every second: see `look`.
 final class WeChatListObserver: @unchecked Sendable {
     static let busyInterval = 0.12
     static let idleInterval = 0.4
@@ -48,6 +48,7 @@ final class WeChatListObserver: @unchecked Sendable {
     private var lastChange = -Double.infinity
     private var lastSearch = -Double.infinity
     private var polls = 0, looks = 0, searches = 0
+    private var lost = 0, unclear = 0
     private var pollSeconds = 0.0, slowestPoll = 0.0
 
     private var now: Double { ProcessInfo.processInfo.systemUptime }
@@ -95,14 +96,49 @@ final class WeChatListObserver: @unchecked Sendable {
 
     /// Before the batch at `directory` is delivered: its TXT gains whatever
     /// transcripts the rows seen of `chat` pin down, and manual-forward.json
-    /// says how that went. Counts only.
-    func mergeTranscripts(intoBatchAt directory: URL, chat: String, exportedAt: Date) {
-        let (evidence, observer) = queue.sync { [self] in
+    /// says how that went, after the `earlier` steps the batch already went
+    /// through. Counts only.
+    func mergeTranscripts(intoBatchAt directory: URL, chat: String, exportedAt: Date, after earlier: [[String: Any]] = []) {
+        let (evidence, observer) = queue.sync { [self] () -> (WeChatListEvidence, [String: Any]) in
             memory.prune(now: Date())
-            return (memory.evidence(chat: chat, exportedAt: exportedAt), report())
+            return (memory.evidence(chat: chat, exportedAt: exportedAt), diagnosis(asked: chat))
         }
         let step = WeChatArchive.mergeObservedVoiceTranscripts(evidence, directory: directory)
-        WeChatArchive.recordManualForward([step], observer: observer)
+        WeChatArchive.recordManualForward(earlier + [step], observer: observer)
+    }
+
+    /// Why a conversation that was watched can still come back empty: sizes
+    /// and counts of the two names, never the names.
+    private func diagnosis(asked: String) -> [String: Any] {
+        func size(_ text: String) -> [String: Int] {
+            ["characters": text.count, "scalars": text.unicodeScalars.count, "bytes": text.utf8.count]
+        }
+        let held = memory.held(chat: asked)
+        var report = report()
+        report["asked"] = size(asked)
+        report["watching"] = size(chat)
+        report["askedIsWatching"] = WeChatForwardPreset.normalizedChat(asked) == chat
+        report["stretchesOfAsked"] = held.stretches
+        report["conversations"] = held.conversations
+        report["results"] = ["lost": lost, "unclear": unclear]
+        return report
+    }
+
+    /// TEMPORARY (diagnosing not-observed): every half minute of watching,
+    /// what a forward arriving now would be told. Counts only.
+    private var lastSelfCheck = -Double.infinity
+    private func selfCheck() {
+        guard now - lastSelfCheck >= 30 else { return }
+        lastSelfCheck = now
+        let asked = (try? WeChatAccessibility.currentChat()) ?? ""
+        var report = diagnosis(asked: asked)
+        report["at"] = ISO8601DateFormatter().string(from: Date())
+        report["evidenceStretches"] = memory.evidence(chat: asked, exportedAt: Date()).stretches.count
+        let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Dukou/WeChat")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: folder.appendingPathComponent("watch.json"), options: .atomic)
+        }
     }
 
     private func report() -> [String: Any] {
@@ -121,6 +157,7 @@ final class WeChatListObserver: @unchecked Sendable {
     private func tick(_ generation: Int) {
         guard generation == self.generation, watching else { return }
         poll()
+        selfCheck()
         let interval = now - lastChange < Self.settleSeconds ? Self.busyInterval : Self.idleInterval
         queue.asyncAfter(deadline: .now() + interval) { [weak self] in self?.tick(generation) }
     }
@@ -138,10 +175,11 @@ final class WeChatListObserver: @unchecked Sendable {
         memory.prune(now: Date())
         switch look() {
         case .lost:
+            lost += 1
             memory.interrupt()
             lastSignature = ""
         case .unclear:
-            break
+            unclear += 1
         case .window(let rows):
             let signature = chat + "\u{1}" + rows.map { "\($0.title)|\($0.ticked.map(String.init) ?? "-")|\($0.y)|\($0.height)" }
                 .joined(separator: "\u{1}")
@@ -163,14 +201,17 @@ final class WeChatListObserver: @unchecked Sendable {
 
     private func look() -> Look {
         guard let root else { return .lost }
-        if list == nil || label == nil {
-            // At most once a second: a window with no conversation open
-            // would otherwise be walked on every look.
-            guard now - lastSearch >= 1 else { return .lost }
+        // Found afresh once a second, and no oftener: a window with no
+        // conversation open would otherwise be walked on every look. Not kept
+        // until they fail, because they do not fail: WeChat goes on answering
+        // for a list and a name it no longer shows, and rows would be filed
+        // under a conversation the user has left.
+        var found = false
+        if now - lastSearch >= 1 {
             lastSearch = now
             searches += 1
             locate(in: root)
-            guard list != nil, label != nil else { return .lost }
+            found = true
         }
         guard let list, let label, let name = Self.text(of: label) else {
             self.list = nil
@@ -178,11 +219,16 @@ final class WeChatListObserver: @unchecked Sendable {
         }
         let current = WeChatForwardPreset.normalizedChat(name)
         if current != chat {
-            // Another conversation may come with another list: find it afresh
-            // rather than read the old element under the new name.
             let first = chat.isEmpty
             chat = current
-            if !first { self.list = nil; return .lost }
+            if !first {
+                // Another conversation may come with another list. One just
+                // found is this conversation's; an older one is found again
+                // rather than read under the new name.
+                guard found else { self.list = nil; return .lost }
+                memory.interrupt()
+                lastSignature = ""
+            }
         }
         guard !chat.isEmpty, let values = Self.values(of: list, Self.listKeys), values.count == 3,
               let children = values[0] as? [AXUIElement] else {

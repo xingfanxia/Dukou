@@ -151,6 +151,13 @@ public struct WeChatListMemory: Sendable {
     public var rowCount: Int { stretches.reduce(0) { $0 + $1.slots.count } }
     public var stretchCount: Int { stretches.count }
 
+    /// For diagnostics, as counts: the stretches held of `chat`, and how many
+    /// conversations anything is held of.
+    public func held(chat: String) -> (stretches: Int, conversations: Int) {
+        let chat = WeChatForwardPreset.normalizedChat(chat)
+        return (stretches.filter { $0.chat == chat }.count, Set(stretches.map(\.chat)).count)
+    }
+
     /// Whatever is seen next does not follow what was seen last.
     public mutating func interrupt() { current = nil }
 

@@ -27,6 +27,9 @@ struct EntriesPane: View {
                 }
             }
 
+            // What a chat export forwarded to any of those entries gains.
+            VoiceTranscriptSettings(preferences: preferences)
+
             SettingsSection(title: L10n.text("附加 Prompt"), systemImage: "text.quote") {
                 PromptSettingsView(preferences: preferences, surface: .forward)
             }

@@ -178,6 +178,8 @@ final class AppModel: ObservableObject {
         for batch in batches where batch.isFirstSeen {
             if comesFromOpenChat(batch) {
                 nameThenAnnounce(batch, reader: reader)
+            } else if preferences.readsVoiceTranscriptsFromDatabase, Self.isOneZip(batch) {
+                mergeThenAnnounce(batch, reader: reader)
             } else {
                 recorded = announce(batch, reader: reader) || recorded
             }
@@ -214,11 +216,15 @@ final class AppModel: ObservableObject {
     /// of, and the extension cannot ask: it holds no Accessibility permission.
     /// The app can, for the moment WeChat is still in front with that chat open.
     private func comesFromOpenChat(_ batch: ReadyBatch) -> Bool {
-        batch.items.count == 1
-            && batch.items[0].url.pathExtension.lowercased() == "zip"
+        Self.isOneZip(batch)
             && Date().timeIntervalSince(batch.createdAt) < Self.chatNameWindow
             && NSWorkspace.shared.frontmostApplication?.bundleIdentifier == WeChatAccessibility.bundleIdentifier
             && AXIsProcessTrusted()
+    }
+
+    /// What WeChat hands a share entry for a forward of messages.
+    private static func isOneZip(_ batch: ReadyBatch) -> Bool {
+        batch.items.count == 1 && batch.items[0].url.pathExtension.lowercased() == "zip"
     }
 
     /// Names the export after its chat the way a quick forward does, then lets
@@ -227,23 +233,36 @@ final class AppModel: ObservableObject {
     ///
     /// Before the name, the TXT gets the transcripts of its converted voice
     /// messages, from what the list showed while the user selected them —
-    /// rewritten in place, before any delivery reads the ZIP. A quick
+    /// rewritten in place, before any delivery reads the ZIP. With the
+    /// database mode on, WeChat's own database is asked first; a TXT that
+    /// gained anything from it reads as already merged to the list. A quick
     /// forward's receipts never come through here: intake is held while it
     /// runs and its batches are already initialised when it resumes. The
-    /// clipboard entry is the exception to "before any delivery": the
-    /// extension has already put the file's URL on the pasteboard, so a paste
-    /// made in the moment this takes reads WeChat's original — whole either
-    /// way, since the new file replaces it in one rename.
+    /// clipboard entry is the exception to "before any delivery", with the
+    /// database mode on or off: the extension has already put the file's URL
+    /// on the pasteboard, so a paste made in the moment this takes reads
+    /// WeChat's original — whole either way, since the new file replaces it
+    /// in one rename. The database step is about 0.4 s when the selection is
+    /// in WeChat's newest file, less than it takes to switch apps and paste.
     private func nameThenAnnounce(_ batch: ReadyBatch, reader: InboxReader) {
         let original = batch.items[0].url
         let nameTemplate = preferences.archiveNameTemplate
+        let readsDatabase = preferences.readsVoiceTranscriptsFromDatabase
         let observer = listObserver, inbox = reader.inbox
         Task { [weak self] in
             let chat: String? = await withCheckedContinuation { continuation in
                 Self.chatNameWorker.async {
+                    // The name before anything slow, while the chat on screen
+                    // is still surely the one the forward came from.
                     let chat = try? WeChatAccessibility.currentChat()
+                    let database = readsDatabase ? WeChatArchive.mergeDatabaseVoiceTranscripts(directory: batch.directory) : nil
+                    if let chat, !chat.isEmpty, let observer {
+                        observer.mergeTranscripts(intoBatchAt: batch.directory, chat: chat, exportedAt: batch.createdAt,
+                                                  after: database.map { [$0] } ?? [])
+                    } else if let database {
+                        WeChatArchive.recordManualForward([database], observer: [:])
+                    }
                     if let chat, !chat.isEmpty {
-                        observer?.mergeTranscripts(intoBatchAt: batch.directory, chat: chat, exportedAt: batch.createdAt)
                         // Read again: a merge leaves the ZIP a different size.
                         try? WeChatExportArchive.rename(
                             InboxReader(inbox: inbox).batch(at: batch.directory) ?? batch, chat: chat, fallbackCount: nil,
@@ -265,6 +284,31 @@ final class AppModel: ObservableObject {
                 FilePasteboard.write([renamed])
             }
             _ = self.announce(current, reader: reader)
+            self.publish(reader.loadBatches())
+        }
+    }
+
+    /// A forward made by hand that `comesFromOpenChat` cannot vouch for — no
+    /// Accessibility, WeChat no longer in front, found late — still gets its
+    /// voice transcripts from WeChat's database when the user turned that on,
+    /// which needs neither. Before the batch arrives, as in
+    /// `nameThenAnnounce`, so a forward to an app pastes the merged ZIP; the
+    /// search is bounded (`WeChatDatabase.searchSeconds`) because that paste
+    /// waits. A clipboard batch arrives here too — the extension's
+    /// `InboxSignal` makes the running app reload — but its URL is already on
+    /// the pasteboard, so the same race as in `nameThenAnnounce` holds: a
+    /// paste within the first moment reads WeChat's original.
+    private func mergeThenAnnounce(_ batch: ReadyBatch, reader: InboxReader) {
+        Task { [weak self] in
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                Self.chatNameWorker.async {
+                    WeChatArchive.recordManualForward([WeChatArchive.mergeDatabaseVoiceTranscripts(directory: batch.directory)], observer: [:])
+                    continuation.resume()
+                }
+            }
+            guard let self else { return }
+            // Read again: a merge leaves the ZIP a different size.
+            _ = self.announce(reader.batch(at: batch.directory) ?? batch, reader: reader)
             self.publish(reader.loadBatches())
         }
     }

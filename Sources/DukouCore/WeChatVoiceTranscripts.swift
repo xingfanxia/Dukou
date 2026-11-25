@@ -88,14 +88,14 @@ public enum WeChatVoiceTranscripts {
 
     /// One of the export's voice lines: where its own text ends, before any
     /// CR, and its duration.
-    struct VoiceLine: Equatable {
-        let end: Int
-        let seconds: Int
+    package struct VoiceLine: Equatable {
+        package let end: Int
+        package let seconds: Int
     }
 
     /// The export's voice lines, oldest first. The text is split on LF alone
     /// and read as bytes, so the offsets are the file's own.
-    static func voiceLines(in text: Data) -> [VoiceLine] {
+    package static func voiceLines(in text: Data) -> [VoiceLine] {
         let bytes = [UInt8](text)
         var lines: [VoiceLine] = []
         var start = 0
@@ -114,7 +114,7 @@ public enum WeChatVoiceTranscripts {
 
     /// `text` with each transcript on the end of the voice line of its
     /// ordinal in `lines`, and every other byte copied through.
-    static func insert(_ transcripts: [Int: String], into text: Data, at lines: [VoiceLine]) -> Data {
+    package static func insert(_ transcripts: [Int: String], into text: Data, at lines: [VoiceLine]) -> Data {
         let bytes = [UInt8](text)
         var output = Data()
         output.reserveCapacity(bytes.count + transcripts.values.reduce(0) { $0 + $1.utf8.count + 16 })
@@ -145,7 +145,7 @@ public enum WeChatVoiceTranscripts {
     }
 
     /// A voice line a merge has already been at: `[语音] 18" 转文字：…`.
-    static func isMergedVoiceLine(_ line: Substring) -> Bool {
+    package static func isMergedVoiceLine(_ line: Substring) -> Bool {
         var rest = line
         if rest.first == "·" { rest = rest.dropFirst() }
         guard let close = rest.firstIndex(of: "\""),
@@ -179,7 +179,7 @@ public enum WeChatVoiceTranscripts {
     /// The receipt's TXT handed to `change`, and written back in place when
     /// `change` returns new text — see `merge(_:intoReceiptAt:)`. A receipt
     /// whose ZIP has no TXT says `withoutTranscript`.
-    static func rewriteTranscript<Result>(ofReceiptAt directory: URL, accepting actions: Set<ShareAction>,
+    package static func rewriteTranscript<Result>(ofReceiptAt directory: URL, accepting actions: Set<ShareAction>,
                                           checkCancellation: () throws -> Void, withoutTranscript: Result,
                                           _ change: (Data) -> (text: Data?, result: Result)) throws -> Result {
         try checkCancellation()

@@ -20,19 +20,28 @@ import Foundation
 /// - In multi-select a ticked row is one of the messages and an unticked one
 ///   is not, where `WeChatListMemory` still knows which it is. Every message
 ///   between two ticked rows is then inside the stretch too, and must be read
-///   off the rows between them. A ticked row saying a text the TXT has once
-///   is that message: an anchor.
+///   off the rows between them.
+/// - A text the TXT has once is that message on the one ticked row that says
+///   it: an anchor. Where no ticked row says it, a rare text (`isRare`) said
+///   by exactly one row of the stretch is taken as that message too, ticked
+///   or not, in multi-select or out of it. An anchor is inside the stretch,
+///   and so is every message between two anchors.
 ///
 /// A voice line is pinned when every reading consistent with all of that puts
 /// it on a row, and every such row has the same transcript. A message may lie
 /// outside a stretch whenever nothing forces it in: the user may have ticked
 /// messages far apart, identical short texts such as 好的 recur, and so do
-/// longer stock replies such as 收到，谢谢老师 — so no text is taken to be
-/// unique to the conversation, and rows seen outside multi-select, or whose
-/// ticks are no longer known, can bound nothing. One stretch that no reading
-/// fits means the evidence is wrong somewhere, and then nothing is attached.
+/// stock replies such as 收到，谢谢老师 — so a short or plain text anchors
+/// only where ticked, and a voice line before a stretch's first anchor or
+/// ticked row, or after its last, stays as it is.
+///
+/// Ticks no reading fits are dropped for that stretch, which is then read off
+/// its rare texts alone: a selection can change where Dukou cannot see it. A
+/// stretch no reading fits even then is wrong somewhere and says nothing; the
+/// others still count.
 public enum WeChatVoiceMatch {
-    /// Per voice line of the export.
+    /// Per voice line of the export, and the stretches that had to be read
+    /// otherwise than as seen.
     public struct Summary: Equatable, Sendable {
         public var voiceLines = 0
         /// Given a transcript.
@@ -43,13 +52,20 @@ public enum WeChatVoiceMatch {
         public var ambiguous = 0
         /// No row seen could have been it.
         public var unseen = 0
+        /// Stretches read without their ticks, which no reading fitted.
+        public var ticksIgnored = 0
+        /// Stretches no reading fitted even without ticks, and skipped.
+        public var contradicting = 0
 
-        public init(voiceLines: Int = 0, attached: Int = 0, notConverted: Int = 0, ambiguous: Int = 0, unseen: Int = 0) {
+        public init(voiceLines: Int = 0, attached: Int = 0, notConverted: Int = 0, ambiguous: Int = 0, unseen: Int = 0,
+                    ticksIgnored: Int = 0, contradicting: Int = 0) {
             self.voiceLines = voiceLines
             self.attached = attached
             self.notConverted = notConverted
             self.ambiguous = ambiguous
             self.unseen = unseen
+            self.ticksIgnored = ticksIgnored
+            self.contradicting = contradicting
         }
     }
 
@@ -62,17 +78,15 @@ public enum WeChatVoiceMatch {
         case unreadable
         /// Nothing of this conversation was seen.
         case notObserved(voiceLines: Int)
-        /// What was seen contradicts the export.
+        /// Nothing was attached, and some stretch of what was seen
+        /// contradicts the export even without its ticks.
         case inconsistent(voiceLines: Int)
         case matched(Summary)
     }
 
     /// `text` is the export's TXT as bytes; see `WeChatVoiceTranscripts.merge`.
     public static func merge(_ evidence: WeChatListEvidence, into text: Data) -> (text: Data, outcome: Outcome) {
-        guard var body = String(data: text, encoding: .utf8) else { return (text, .unreadable) }
-        // A CRLF is one Character to Swift and would never split on "\n".
-        body = body.replacingOccurrences(of: "\r\n", with: "\n")
-        if body.hasPrefix("\u{feff}") { body.removeFirst() }
+        guard let body = normalized(text) else { return (text, .unreadable) }
         if body.split(separator: "\n", omittingEmptySubsequences: false).contains(where: WeChatVoiceTranscripts.isMergedVoiceLine) {
             return (text, .alreadyMerged)
         }
@@ -82,15 +96,14 @@ public enum WeChatVoiceMatch {
               messages.compactMap(\.seconds) == lines.map(\.seconds) else { return (text, .unreadable) }
         guard evidence.rowCount > 0 else { return (text, .notObserved(voiceLines: lines.count)) }
 
+        var summary = Summary(voiceLines: lines.count)
         var verdicts = Array(repeating: [Verdict](), count: messages.count)
         for stretch in evidence.stretches where !stretch.rows.isEmpty {
-            guard let found = verdictsOfVoices(messages, in: stretch, anchors: anchors(messages, in: stretch)) else {
-                return (text, .inconsistent(voiceLines: lines.count))
-            }
-            for (index, verdict) in found { verdicts[index].append(verdict) }
+            guard let reading = read(stretch, as: messages) else { summary.contradicting += 1; continue }
+            if reading.withoutTicks { summary.ticksIgnored += 1 }
+            for (index, verdict) in reading.verdicts { verdicts[index].append(verdict) }
         }
 
-        var summary = Summary(voiceLines: lines.count)
         var added: [Int: String] = [:]
         let voices = messages.indices.filter { messages[$0].seconds != nil }
         for (ordinal, index) in voices.enumerated() {
@@ -103,7 +116,9 @@ public enum WeChatVoiceMatch {
             case .unseen: summary.unseen += 1
             }
         }
-        guard !added.isEmpty else { return (text, .matched(summary)) }
+        guard !added.isEmpty else {
+            return (text, summary.contradicting > 0 ? .inconsistent(voiceLines: lines.count) : .matched(summary))
+        }
         return (WeChatVoiceTranscripts.insert(added, into: text, at: lines), .matched(summary))
     }
 
@@ -111,21 +126,32 @@ public enum WeChatVoiceMatch {
     /// in place when `merge` attached anything, exactly as
     /// `WeChatVoiceTranscripts.merge(_:intoReceiptAt:)` does for a quick
     /// forward; untouched in every other outcome and whenever this throws.
+    /// `original` is handed the TXT as WeChat wrote it, before the merge.
     public static func merge(_ evidence: WeChatListEvidence, intoReceiptAt directory: URL,
-                             checkCancellation: () throws -> Void = {}) throws -> Outcome {
+                             checkCancellation: () throws -> Void = {}, original: (Data) -> Void = { _ in }) throws -> Outcome {
         try WeChatVoiceTranscripts.rewriteTranscript(
             ofReceiptAt: directory, accepting: Set(ShareAction.allCases), checkCancellation: checkCancellation,
             withoutTranscript: .noVoiceLines
-        ) { original in
-            let (text, outcome) = merge(evidence, into: original)
+        ) { transcript in
+            original(transcript)
+            let (text, outcome) = merge(evidence, into: transcript)
             return (text, outcome)
         }
     }
 
     // MARK: - The export
 
+    /// The TXT as `messages(in:)` reads it, or nil when it is not UTF-8.
+    package static func normalized(_ text: Data) -> String? {
+        guard var body = String(data: text, encoding: .utf8) else { return nil }
+        // A CRLF is one Character to Swift and would never split on "\n".
+        body = body.replacingOccurrences(of: "\r\n", with: "\n")
+        if body.hasPrefix("\u{feff}") { body.removeFirst() }
+        return body
+    }
+
     /// A message of the export, as far as matching needs it.
-    enum Message: Equatable {
+    package enum Message: Equatable {
         case voice(seconds: Int)
         /// One line of plain text, whitespace folded.
         case text(String)
@@ -133,7 +159,7 @@ public enum WeChatVoiceMatch {
         /// files, cards, emoji, several lines.
         case opaque
 
-        var seconds: Int? { if case .voice(let seconds) = self { seconds } else { nil } }
+        package var seconds: Int? { if case .voice(let seconds) = self { seconds } else { nil } }
     }
 
     /// Nil when the layout is not one WeChat writes. With senders and times
@@ -141,7 +167,7 @@ public enum WeChatVoiceMatch {
     /// of a line, first or after an empty one, and an indented line belongs
     /// to the card above it.
     /// `body` has LF line ends and no byte order mark.
-    static func messages(in body: String) -> [Message]? {
+    package static func messages(in body: String) -> [Message]? {
         if let records = try? WeChatTranscriptRecord.parse(body) { return records.map { message(from: $0.text) } }
         var bodies: [[Substring]] = []
         var afterBlank = true
@@ -167,15 +193,21 @@ public enum WeChatVoiceMatch {
     // MARK: - Text
 
     /// Whitespace runs, line breaks included, as one space; trimmed.
-    static func folded(_ text: String) -> String {
+    package static func folded(_ text: String) -> String {
         text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
     }
 
     /// Long and varied enough that two looks agreeing on it, among rows that
     /// moved with it, are unlikely to be two messages. Not enough to take it
-    /// as said once in a conversation; see `anchors`.
+    /// as said once in a conversation; see `isRare`.
     static func isDistinctive(_ text: String) -> Bool {
         text.count >= 6 && Set(text.filter { $0.isLetter || $0.isNumber }).count >= 4
+    }
+
+    /// Long enough to take as said once where it is seen once: a stock reply
+    /// such as 收到，谢谢老师 is shorter. See `anchors`.
+    static func isRare(_ text: String) -> Bool {
+        text.count >= 8 && isDistinctive(text)
     }
 
     /// Whether `row` reads as `message` — never false for the row it is.
@@ -199,17 +231,23 @@ public enum WeChatVoiceMatch {
     /// The stretch's anchors: message → row. A ticked row is one of the
     /// exported messages, so when it says a text the export has exactly
     /// once, it is that message — however often the rest of the conversation
-    /// says the same. A row that says two such texts (a sender's name runs
-    /// into the text in multi-select), or a text two ticked rows say, anchors
-    /// nothing. Nothing else anchors: no text can be shown to be said once in
-    /// a whole conversation.
+    /// says the same. Where no ticked row says it, a rare text said by
+    /// exactly one row not known to be unticked is taken as that message on
+    /// that row: no text can be shown to be said once in a whole
+    /// conversation, but a long one seen once among rows seen without a gap
+    /// seldom is twice. A row that
+    /// says two such texts (a sender's name runs into the text in
+    /// multi-select) anchors nothing, and nor does a text two of the rows it
+    /// would be taken from say.
     static func anchors(_ messages: [Message], in stretch: WeChatObservedStretch) -> [Int: Int] {
         var counts: [String: Int] = [:]
         for case .text(let text) in messages { counts[text, default: 0] += 1 }
         var anchors: [Int: Int] = [:], taken = Set<Int>(), shared = Set<Int>()
         for (index, message) in messages.enumerated() {
             guard case .text(let text) = message, counts[text] == 1 else { continue }
-            let rows = stretch.rows.indices.filter { stretch.rows[$0].ticked == true && says(stretch.rows[$0], text, multiSelect: stretch.multiSelect) }
+            let saying = stretch.rows.indices.filter { stretch.rows[$0].ticked != false && says(stretch.rows[$0], text, multiSelect: stretch.multiSelect) }
+            let ticked = saying.filter { stretch.rows[$0].ticked == true }
+            let rows = ticked.isEmpty && isRare(text) ? saying : ticked
             guard rows.count == 1, let row = rows.first else { continue }
             if !taken.insert(row).inserted { shared.insert(row) }
             anchors[index] = row
@@ -227,11 +265,27 @@ public enum WeChatVoiceMatch {
         case unseen
     }
 
+    /// What `stretch` says of the voice messages: as seen, or, when no
+    /// reading fits its ticks, without them — anchors found again, so rare
+    /// texts alone. Nil when no reading fits even then. `anchors` are the
+    /// ones the verdicts were read with.
+    static func read(_ stretch: WeChatObservedStretch, as messages: [Message])
+        -> (verdicts: [(Int, Verdict)], anchors: [Int: Int], withoutTicks: Bool)? {
+        let seen = anchors(messages, in: stretch)
+        if let verdicts = verdictsOfVoices(messages, in: stretch, anchors: seen) { return (verdicts, seen, false) }
+        guard stretch.rows.contains(where: { $0.ticked != nil }) else { return nil }
+        let unticked = WeChatObservedStretch(multiSelect: stretch.multiSelect,
+                                             rows: stretch.rows.map { WeChatObservedRow(title: $0.title, voice: $0.voice) })
+        let rare = anchors(messages, in: unticked)
+        return verdictsOfVoices(messages, in: unticked, anchors: rare).map { ($0, rare, true) }
+    }
+
     /// For each voice message, what the stretch says of it. Nil when no
     /// reading fits the stretch at all.
     ///
     /// A reading puts a run of the export, `lo...hi`, on rows in order, each
-    /// on a row it agrees with; every anchor in the stretch on its row; every
+    /// on a row it agrees with; every anchor in the stretch on its row, ticked
+    /// or not, so the run reaches from the first anchor to the last; every
     /// ticked row under a message and no unticked one. The messages before
     /// `lo` and after `hi` are outside the stretch. `reach` and `back` are the
     /// two halves: whether a reading's first part can end with message `i` on

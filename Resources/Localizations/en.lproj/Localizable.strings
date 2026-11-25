@@ -132,6 +132,15 @@
 "没有找到 %@，装好后再勾选。" = "Couldn’t find %@. Install it, then tick this again.";
 "没能生成「%@」的入口。" = "Couldn’t create the entry for “%@”.";
 "系统没有登记「%@」的入口，请稍后再勾选一次。" = "macOS didn’t register the entry for “%@”. Tick it again in a moment.";
+"语音转文字" = "Voice transcripts";
+"从微信本地数据库读取语音转文字" = "Read voice transcripts from WeChat’s local database";
+"需要 chatlog 已保存在 ~/.chatlog/chatlog.json 的密钥。只读，内容不离开这台 Mac。打开后，手动转发的语音会在转发后一秒左右补上微信里转出的文字，直接写进那个 ZIP。" = "Needs a key chatlog has already saved in ~/.chatlog/chatlog.json. Read only; nothing leaves this Mac. When on, voice messages you forward by hand get the text WeChat converted them to, written into the ZIP itself within about a second of the forward.";
+"正在检查…" = "Checking…";
+"已就绪：找到了微信的数据库和能打开它的密钥。" = "Ready: found WeChat’s database and a key that opens it.";
+"找不到密钥：~/.chatlog/chatlog.json 不存在，或里面没有密钥。" = "No key: ~/.chatlog/chatlog.json is missing or has no key in it.";
+"密钥对不上：chatlog 保存的密钥都打不开当前微信账号的数据库。" = "Key doesn’t match: none of the keys chatlog saved opens this WeChat account’s database.";
+"macOS 拒绝了 Dukou 读取微信的数据，可在「系统设置 → 隐私与安全性」里更改。" = "macOS denied Dukou access to WeChat’s data. You can change this in System Settings → Privacy & Security.";
+"读不到微信的数据文件夹。" = "Can’t read WeChat’s data folder.";
 
 /* Settings window · Permissions */
 "系统权限" = "System permissions";
@@ -159,7 +168,7 @@
 "版本 %@ (%@)" = "Version %@ (%@)";
 "Dukou 做什么" = "What Dukou does";
 "在微信的转发菜单里，直接把聊天记录送到你要用的地方。" = "Send chat history straight from WeChat's forward menu to wherever you need it.";
-"也是聊天记录与朋友圈的本地备份工具：导出只走微信自带的转发和朋友圈界面，不读数据库、不解密、不注入。" = "It doubles as a local backup tool for your chats and Moments: exports go through WeChat's own forward menu and Moments window — no database reads, no decryption, no injection.";
+"也是聊天记录与朋友圈的本地备份工具：导出只走微信自带的转发和朋友圈界面，不注入；除非打开了语音转文字的数据库读取，也不读数据库、不解密。" = "It doubles as a local backup tool for your chats and Moments: exports go through WeChat’s own forward menu and Moments window, with no injection — and no database reads or decryption unless you turn on reading voice transcripts from WeChat’s database.";
 "聊天文件在本机处理，渡口不会上传聊天内容。文件会按清理设置保留，可随时在「记录」中管理。" = "Chat files are processed on this Mac. Dukou does not upload your conversations. Files follow your retention settings and can be managed in History.";
 "链接" = "Links";
 "源码与问题反馈" = "Source and issues";

@@ -99,8 +99,8 @@ final class WeChatVoiceMatchTests: XCTestCase {
 
     // MARK: - Outside multi-select
 
-    func testRowsSeenOutsideMultiSelectPinNothing() {
-        // Even between two long texts: either could be said again where the
+    func testRowsSeenOutsideMultiSelectPinOnlyBetweenRareTexts() {
+        // Not between stock replies: either could be said again where the
         // user ticked, unseen. 收到，谢谢老师 is said again and again in a
         // parents' group, and so is an 18" voice message between replies.
         let stock = ["收到，谢谢老师", "语音18\"秒明天上午十点开会", "好的，辛苦了"]
@@ -108,7 +108,13 @@ final class WeChatVoiceMatchTests: XCTestCase {
         let (merged, outcome) = merge(text, [browsed(stock)])
         XCTAssertEqual(summary(outcome), .init(voiceLines: 1, ambiguous: 1))
         XCTAssertEqual(merged, String(decoding: text, as: UTF8.self))
-        for picks in [[5, 6, 7, 8, 9], [6, 7, 8, 9], [9, 10], [3, 4, 5]] {
+        // Between rows 5 and 9, both rare, the 7" and 20" messages are read
+        // off the rows between. Before the first rare text or after the
+        // last, a voice message may be one selected outside the stretch.
+        let between = match(export([5, 6, 7, 8, 9]), [look(0...10)])
+        XCTAssertEqual(summary(between.outcome), .init(voiceLines: 2, attached: 1, notConverted: 1))
+        XCTAssertTrue(between.text.contains("[语音] 7\" 转文字：收到\n"), between.text)
+        for picks in [[6, 7, 8, 9], [9, 10], [3, 4, 5]] {
             XCTAssertEqual(summary(match(export(picks), [look(0...10)]).outcome)?.attached, 0, "\(picks)")
         }
         // Nor do they get in the way of a selection.
@@ -117,6 +123,60 @@ final class WeChatVoiceMatchTests: XCTestCase {
         ].map { WeChatObservedRow(title: $0, voice: WeChatVoiceMessage.parse(row: $0), ticked: true) })])
         XCTAssertEqual(summary(both.outcome)?.attached, 1)
         XCTAssertTrue(both.text.contains("[语音] 18\" 转文字：我不去了\n"), both.text)
+    }
+
+    // MARK: - Rare texts
+
+    /// Rows seen outside multi-select around one 12" voice message.
+    private let aroundAVoice = ["周末的活动改到市图书馆二楼", "好的", "语音12\"秒我在路上了马上到", "图片", "会议纪要已经发到邮箱里了"]
+    private let betweenRareTexts = Data("·周末的活动改到市图书馆二楼\n\n·[语音] 12\"\n\n·会议纪要已经发到邮箱里了\n\n".utf8)
+
+    func testAVoiceBetweenTwoRareTextsIsAttachedAndBesideAShortOneIsNot() {
+        let (merged, outcome) = merge(betweenRareTexts, [browsed(aroundAVoice)])
+        XCTAssertEqual(summary(outcome), .init(voiceLines: 1, attached: 1))
+        XCTAssertTrue(merged.contains("·[语音] 12\" 转文字：我在路上了马上到\n"), merged)
+        // A short or stock reply anchors nothing, so the voice message is
+        // before the only anchor: it may be one selected outside the stretch.
+        for opening in ["好的", "收到，谢谢老师"] {
+            var rows = aroundAVoice
+            rows[0] = opening
+            let text = Data("·\(opening)\n\n·[语音] 12\"\n\n·会议纪要已经发到邮箱里了\n\n".utf8)
+            XCTAssertEqual(summary(merge(text, [browsed(rows)]).outcome), .init(voiceLines: 1, ambiguous: 1), opening)
+        }
+    }
+
+    func testAVoiceAfterTheLastRareTextIsAttachedOnlyWhereATickBoundsIt() throws {
+        // The end of the export: a reading may stop at the rare text on row
+        // 9, and the 9" message be one ticked farther on, unseen.
+        let text = export([9, 10])
+        XCTAssertEqual(summary(match(text, [look(4...10)]).outcome), .init(voiceLines: 1, ambiguous: 1))
+        XCTAssertEqual(summary(merge(text, [selection(4...10, ticked: [], unknown: Set(4...10))]).outcome),
+                       .init(voiceLines: 1, ambiguous: 1))
+        // A ticked row after it must be read too. The rare text's own row is
+        // still not known to be ticked, and anchors all the same.
+        let stretch = selection(4...10, ticked: [10], unknown: Set(4...9))
+        let messages = try XCTUnwrap(WeChatVoiceMatch.messages(in: String(decoding: text, as: UTF8.self)))
+        XCTAssertEqual(WeChatVoiceMatch.anchors(messages, in: stretch), [0: 5])
+        let bounded = merge(text, [stretch])
+        XCTAssertEqual(summary(bounded.outcome), .init(voiceLines: 1, attached: 1))
+        XCTAssertTrue(bounded.text.contains("[语音] 9\" 转文字：报表我已经发群里了\n"), bounded.text)
+    }
+
+    func testTwoVoicesOfOneDurationBetweenRareTextsAreAmbiguous() {
+        var rows = aroundAVoice
+        rows[3] = "语音12\"秒我已经到楼下了"
+        let (merged, outcome) = merge(betweenRareTexts, [browsed(rows)])
+        XCTAssertEqual(summary(outcome), .init(voiceLines: 1, ambiguous: 1))
+        XCTAssertEqual(merged, String(decoding: betweenRareTexts, as: UTF8.self))
+    }
+
+    func testARareTextTwoRowsSayAnchorsNothing() throws {
+        let messages = try XCTUnwrap(WeChatVoiceMatch.messages(in: String(decoding: betweenRareTexts, as: UTF8.self)))
+        XCTAssertEqual(WeChatVoiceMatch.anchors(messages, in: browsed(aroundAVoice)), [0: 0, 2: 4])
+        var rows = aroundAVoice
+        rows[1] = rows[4]
+        XCTAssertEqual(WeChatVoiceMatch.anchors(messages, in: browsed(rows)), [0: 0])
+        XCTAssertEqual(summary(merge(betweenRareTexts, [browsed(rows)]).outcome), .init(voiceLines: 1, ambiguous: 1))
     }
 
     // MARK: - Multi-select
@@ -186,13 +246,28 @@ final class WeChatVoiceMatchTests: XCTestCase {
                                                 in: selection(0...10, ticked: [2, 7])), [:])
     }
 
-    func testAStretchNoReadingFitsAttachesNothingAnywhere() {
-        // A 9" message between two ticked rows whose rows have none: the ticks
-        // or the export are not what they seem.
+    func testTicksNoReadingFitsAreDroppedForTheirStretch() {
+        // Row 7 reads ticked, but the export has nothing between the 7"
+        // message and row 9: the ticks are wrong somewhere. Without them the
+        // rare texts on rows 5 and 9 still hold the 7" message between them.
+        let (merged, outcome) = match(export([5, 6, 9]), [look(4...10, ticked: [5, 6, 7, 9])])
+        XCTAssertEqual(summary(outcome), .init(voiceLines: 1, attached: 1, ticksIgnored: 1))
+        XCTAssertTrue(merged.contains("[语音] 7\" 转文字：收到\n"), merged)
+    }
+
+    func testAStretchNoReadingFitsEvenWithoutTicksIsSkipped() throws {
+        // A 9" message between two rare texts whose rows have none: the
+        // export or the rows are not what they seem, ticks or no ticks.
         let text = export([5, 6, 9]).replacingVoice(7, with: 9)
         let (merged, outcome) = match(text, [look(0...10, ticked: [5, 6, 9])])
         XCTAssertEqual(outcome, .inconsistent(voiceLines: 1))
         XCTAssertEqual(merged, String(decoding: text, as: UTF8.self))
+        // It says nothing, and another stretch is still read.
+        let wrong = try XCTUnwrap(remember([look(0...10, ticked: [5, 6, 9])]).evidence(chat: chat, exportedAt: later).stretches.first)
+        let other = browsed(["会议室改到三楼东侧", "语音9\"秒我先过去占位置", "记得带上周的报表过来"])
+        let both = merge(text, [wrong, other])
+        XCTAssertEqual(summary(both.outcome), .init(voiceLines: 1, attached: 1, contradicting: 1))
+        XCTAssertTrue(both.text.contains("[语音] 9\" 转文字：我先过去占位置\n"), both.text)
     }
 
     func testRowsOutsideAndInsideMultiSelectAreNotMixed() {
@@ -296,16 +371,19 @@ final class WeChatVoiceMatchTests: XCTestCase {
 
     func testRowsTickedOffScreenByARangeAreNotTakenAsUnticked() {
         // Clicked row 0, scrolled, Shift-clicked row 6: WeChat ticked 0 to 6,
-        // and rows 1 and 2 were last seen unticked. Believed, that would
-        // leave no reading; forgotten, the lines it no longer knows about
-        // stay alone and the ones it does are pinned.
+        // and rows 1 and 2 were last seen unticked. Believed, those ticks
+        // would fit no reading and all of them would be dropped; forgotten,
+        // the ones still known hold, the rare text on row 0 opens the run,
+        // and rows 1 and 2 are read like any others.
         let text = export(Array(0...6))
         var memory = clickedThenScrolled()
         memory.observe(chat: chat, rows: look(3...9, top: 0, ticked: Set(0...6)), at: start.addingTimeInterval(0.6))
-        let (merged, outcome) = WeChatVoiceMatch.merge(memory.evidence(chat: chat, exportedAt: later), into: text)
-        XCTAssertEqual(summary(outcome), .init(voiceLines: 3, attached: 2, ambiguous: 1))
+        let evidence = memory.evidence(chat: chat, exportedAt: later)
+        XCTAssertEqual(evidence.stretches.first?.rows.map(\.ticked), [nil, nil, nil, true, true, true, true, false, false, false])
+        let (merged, outcome) = WeChatVoiceMatch.merge(evidence, into: text)
+        XCTAssertEqual(summary(outcome), .init(voiceLines: 3, attached: 3))
         let body = String(decoding: merged, as: UTF8.self)
-        XCTAssertTrue(body.hasPrefix("·大家早，今天下午三点开会\n\n·[语音] 18\"\n\n·好的\n\n·[语音] 18\" 转文字：我晚点到，先开始吧\n"), body)
+        XCTAssertTrue(body.hasPrefix("·大家早，今天下午三点开会\n\n·[语音] 18\" 转文字：明天上午十点开会\n\n·好的\n\n·[语音] 18\" 转文字：我晚点到，先开始吧\n"), body)
         XCTAssertTrue(body.contains("[语音] 7\" 转文字：收到\n"))
     }
 
@@ -481,6 +559,59 @@ final class WeChatVoiceMatchTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: receipt.directory.appendingPathComponent(BatchStaging.manifestFileName)), manifest)
         // A quick forward's merge still takes only its own entry's receipts.
         XCTAssertThrowsError(try WeChatVoiceTranscripts.merge([WeChatVoiceMessage(seconds: 18, transcript: "好")], intoReceiptAt: receipt.directory))
+    }
+
+    // MARK: - Explanation
+
+    func testTheExplanationHoldsNoTextAndSaysWhatEachRowAgreesWith() throws {
+        let text = Data("·Lunch is moved to the second floor\n\n·[语音] 12\"\n\n·会议纪要已经发到邮箱里了\n\n".utf8)
+        let seen = ["Lunch is moved to the second floor", "语音12\"秒我在路上了马上到", "好的", "会议纪要已经发到邮箱里了（已更新）", "会议纪要已经发到邮箱里了"]
+        // Ticked 好的 is no message: read without ticks.
+        let selected: [(String, Bool?)] = [
+            ("小林 Lin Lunch is moved to the second floor", nil), ("阿 语音 好的", true),
+            ("小林 Lin 语音12\"秒我在路上了马上到", nil), ("阿 语音 会议纪要已经发到邮箱里了", nil),
+        ]
+        let ticked = WeChatObservedStretch(multiSelect: true, rows: selected.map {
+            WeChatObservedRow(title: $0.0, voice: WeChatVoiceMessage.parse(row: $0.0), ticked: $0.1)
+        })
+        // No 12" row between the two: skipped.
+        let wrong = browsed(["Lunch is moved to the second floor", "语音30\"秒", "会议纪要已经发到邮箱里了"])
+        let evidence = WeChatListEvidence(stretches: [browsed(seen), ticked, WeChatObservedStretch(multiSelect: true, rows: []), wrong])
+        XCTAssertEqual(WeChatVoiceMatch.merge(evidence, into: text).outcome,
+                       .matched(.init(voiceLines: 1, attached: 1, ticksIgnored: 1, contradicting: 1)))
+
+        let explanation = WeChatVoiceMatch.explain(evidence, text: text)
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: explanation, options: [.sortedKeys]), as: UTF8.self)
+        for said in seen + ticked.rows.map(\.title) + ["Lunch", "second floor", "我在路上了马上到", "好的", "小林", "Lin"] {
+            XCTAssertFalse(json.contains(said), said)
+        }
+        XCTAssertTrue(json.unicodeScalars.allSatisfy(\.isASCII), json)
+
+        let messages = try XCTUnwrap(explanation["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.map { $0["kind"] as? String }, ["text", "voice", "text"])
+        XCTAssertEqual(messages.map { $0["rare"] as? Bool }, [true, nil, true])
+        XCTAssertEqual(messages[1]["seconds"] as? Int, 12)
+        XCTAssertEqual(messages[1]["verdict"] as? String, "attached")
+        let stretches = try XCTUnwrap(explanation["stretches"] as? [[String: Any]])
+        XCTAssertEqual(stretches.map { $0["result"] as? String }, ["read", "read-without-ticks", "no-rows", "contradicting"])
+        XCTAssertEqual(stretches.map { $0["anchors"] as? [String: Int] },
+                       [["count": 2, "soft": 2], ["count": 2, "soft": 2], ["count": 0, "soft": 0], ["count": 2, "soft": 2]])
+        let rows = try XCTUnwrap(stretches[0]["rows"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["says"] as? [Int] }, [[0], [], [], [], [2]])
+        XCTAssertEqual(rows.map { $0["agreesVoice"] as? [Int] }, [[], [1], [], [], []])
+        XCTAssertEqual(rows[3]["contains"] as? [[String: Int]], [["message": 2, "offset": 0, "titleLength": 17]])
+        let multi = try XCTUnwrap(stretches[1]["rows"] as? [[String: Any]])
+        XCTAssertEqual(multi.map { $0["says"] as? [Int] }, [[0], [], [], [2]])
+        XCTAssertEqual(multi.map { $0["ticked"] as? Bool }, [nil, true, nil, nil])
+        XCTAssertTrue(multi[0]["ticked"] is NSNull)
+        XCTAssertEqual(multi.map { $0["hasVoiceWordUnparsed"] as? Bool }, [false, true, false, true])
+        XCTAssertEqual(multi[0]["spaces"] as? Int, 8)
+        // One transcript seen in two stretches carries one tag.
+        let voice = try XCTUnwrap(rows[1]["voice"] as? [String: Any])
+        XCTAssertEqual(voice["transcriptLength"] as? Int, 8)
+        XCTAssertEqual(voice["transcriptTag"] as? String, (multi[2]["voice"] as? [String: Any])?["transcriptTag"] as? String)
+        XCTAssertEqual(WeChatVoiceMatch.tag("a"), "e40c29")
+        XCTAssertEqual(WeChatVoiceMatch.tag(""), "811c9d")
     }
 
     private func batch(_ data: Data, action: ShareAction) throws -> ReadyBatch {
